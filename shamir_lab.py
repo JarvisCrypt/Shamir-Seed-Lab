@@ -17,6 +17,18 @@ Security design principles:
   * Environment checks (swap, core dumps, network, redirection)
   * No network access, no shell calls, no files written
 
+Recovery notes (v3.3):
+  * The passphrase is requested up front and can be re-entered if
+    decryption fails.
+  * Any number of shares (>= threshold) may be entered. The reference
+    combine_mnemonics() requires EXACTLY T shares per group, so this
+    tool selects a valid T-subset itself. The threshold is learned
+    from the library's own error message ("Expected N mnemonics"),
+    which is stable across library versions, or from a per-share
+    validation probe.
+  * Each entered share is structurally validated immediately
+    (checksum / wordlist errors are reported at input time).
+
 Dependencies (reference implementations by SatoshiLabs):
   pip install mnemonic shamir-mnemonic
 
@@ -28,11 +40,24 @@ import getpass
 import hashlib
 import os
 import random
+import re
 import signal
 import sys
+from itertools import combinations
 
 from mnemonic import Mnemonic
 from shamir_mnemonic import generate_mnemonics, combine_mnemonics
+
+# Optional share decoder from newer versions of the reference package
+# (shamir-mnemonic >= 1.3.0). Used only for nicer diagnostics; all
+# core functionality works without it.
+try:
+    from shamir_mnemonic.share import decode_mnemonic as _decode_mnemonic
+except ImportError:
+    try:
+        from shamir_mnemonic import decode_mnemonic as _decode_mnemonic
+    except ImportError:
+        _decode_mnemonic = None
 
 
 # ============================================================
@@ -40,11 +65,23 @@ from shamir_mnemonic import generate_mnemonics, combine_mnemonics
 # ============================================================
 
 APP_NAME = "Shamir Seed Lab"
-APP_VERSION = "3.1"
+APP_VERSION = "3.3"
 WORDLIST_LANGUAGE = "english"   # BIP-39 wordlist (not the UI language)
 BIP39_STRENGTH = 256            # 24 words
 MAX_SHARES = 16                 # SLIP-39 maximum per group
 ITERATION_EXPONENT = 2          # PBKDF2: 10000 * 2^2 = 40000 iterations
+
+# combine_mnemonics() raises "Wrong number of mnemonics. Expected N
+# mnemonics ..." when more shares than the threshold are provided.
+# That message is produced before the slow passphrase KDF and is the
+# version-independent way to learn the threshold.
+_EXPECTED_COUNT_RE = re.compile(r"Expected (\d+) mnemonics")
+
+# Any T valid shares interpolate to the same encrypted secret, so with
+# a correct passphrase the very first T-subset succeeds. This cap only
+# bounds the damage when something is wrong (bad passphrase, mixed
+# backups): at most this many slow decrypt attempts per try_combine.
+MAX_DECRYPT_ATTEMPTS = 8
 
 
 # ============================================================
@@ -178,24 +215,30 @@ TRANSLATIONS = {
         "rec_intro1": "Enter the shares one at a time (each is a 33-word phrase).",
         "rec_intro2": "Input is VISIBLE — check for typos as you type.",
         "rec_intro3": "After each share the program tries to recover the secret.",
-        "rec_intro4": "If it does not succeed automatically, press Enter to enter",
-        "rec_intro5": "a passphrase (if one was used) or more shares.",
+        "rec_intro4": "You may enter more shares than required — the program will pick a valid combination.",
+        "rec_pp_used": "Was a passphrase used when this backup was created?",
+        "rec_pp_prompt": "Passphrase (Enter = none):",
         "rec_share_header": "--- Share {num} ---",
-        "rec_share_prompt": "Enter share (Enter = try to recover):",
+        "rec_share_prompt": "Enter share (or press Enter for options):",
         "rec_first": "Enter at least one share first.",
         "rec_dup": "This share has already been entered. Enter a different one.",
+        "rec_dup_slot": "Share #{member} of this set has already been entered. Enter a different share.",
+        "rec_foreign": "This share belongs to a DIFFERENT backup (different identifier). Do not mix shares from different backups!",
+        "rec_mixed": "This share's parameters differ from the previously entered ones — it is likely from a DIFFERENT backup. Do not mix shares from different backups!",
+        "rec_invalid_share": "This is not a valid share: {err}",
+        "rec_status": "Shares collected: {have} of {need} required.",
         "rec_accepted": "Shares accepted: {count}",
+        "rec_pp_suspect_title": "Enough shares collected, but the secret cannot be decrypted.",
+        "rec_pp_suspect_hint": "This almost always means the passphrase is wrong.",
+        "rec_pp_retry": "Re-enter the passphrase?",
         "rec_recovered": "Secret recovered!",
-        "rec_failed": "Recovery is not possible yet.",
-        "rec_pp_ask1": "If a passphrase was used when the backup was created,",
-        "rec_pp_ask2": "enter it now. If there was no passphrase, press Enter.",
-        "rec_pp_prompt": "Passphrase (Enter = none):",
         "rec_reasons": "Still cannot recover. Possible reasons:",
         "rec_reason1": "• Not enough shares (T are required)",
         "rec_reason2": "• Wrong passphrase",
         "rec_reason3": "• Typos in the shares",
         "rec_reason4": "• Shares from different backups",
         "rec_continue": "Continue entering shares?",
+        "rec_aborted": "Recovery aborted. Secrets cleared from memory.",
         "rec_fp_intro1": "Every share sheet has the secret fingerprint on it.",
         "rec_fp_intro2": "Enter it to verify (Enter = skip):",
         "rec_fp_prompt": "Fingerprint:",
@@ -216,13 +259,15 @@ TRANSLATIONS = {
         "test_generating": "Generating a test secret...",
         "test_splitting": "Splitting {threshold}-of-{total} (up to a minute)...",
         "test_split_error": "Splitting error: {err}",
-        "test_1": "Test 1: first {threshold} shares",
-        "test_2": "Test 2: last {threshold} shares",
-        "test_3": "Test 3: random {threshold} shares",
-        "test_4": "Test 4: all {total} shares",
+        "test_1": "Test 1: shares #1-{threshold}",
+        "test_2": "Test 2: shares #{start}-{end}",
+        "test_3": "Test 3: random shares ({threshold})",
+        "test_4": "Test 4: all {total} shares at once",
         "test_5": "Test 5: {count} shares (must be rejected)",
         "test_6": "Test 6: wrong passphrase (must not match)",
         "test_7": "Test 7: fingerprint reproducibility",
+        "test_8": "Test 8: shares in reverse order ({threshold})",
+        "test_9": "Test 9: extra shares, threshold auto-detected",
         "test_exc": "exception — {err}",
         "test_result": "RESULT: {passed} of {total} tests passed",
         "test_all_ok": "ALL TESTS PASSED",
@@ -388,24 +433,30 @@ TRANSLATIONS = {
         "rec_intro1": "Введите доли по одной (каждая — фраза из 33 слов).",
         "rec_intro2": "Ввод будет ВИДЕН — проверяйте ввод на опечатки.",
         "rec_intro3": "После каждой доли программа пробует восстановить секрет.",
-        "rec_intro4": "Если автоматически не получается — нажмите Enter, чтобы",
-        "rec_intro5": "ввести passphrase (если он использовался) или ещё доли.",
+        "rec_intro4": "Можно ввести больше долей, чем требуется — программа выберет подходящую комбинацию.",
+        "rec_pp_used": "Использовался ли passphrase при создании этого бэкапа?",
+        "rec_pp_prompt": "Passphrase (Enter = нет):",
         "rec_share_header": "--- Доля {num} ---",
-        "rec_share_prompt": "Введите долю (Enter = попробовать восстановить):",
+        "rec_share_prompt": "Введите долю (или Enter — опции):",
         "rec_first": "Сначала введите хотя бы одну долю.",
         "rec_dup": "Эта доля уже введена. Введите другую.",
+        "rec_dup_slot": "Доля №{member} из этого набора уже введена. Введите другую долю.",
+        "rec_foreign": "Эта доля принадлежит ДРУГОМУ бэкапу (другой идентификатор). Не смешивайте доли из разных бэкапов!",
+        "rec_mixed": "Параметры этой доли отличаются от введённых ранее — вероятно, это доля из ДРУГОГО бэкапа. Не смешивайте доли из разных бэкапов!",
+        "rec_invalid_share": "Это некорректная доля: {err}",
+        "rec_status": "Собрано долей: {have} из {need} необходимых.",
         "rec_accepted": "Принято долей: {count}",
+        "rec_pp_suspect_title": "Собрано достаточно долей, но расшифровать секрет не удаётся.",
+        "rec_pp_suspect_hint": "Почти всегда это означает неверный passphrase.",
+        "rec_pp_retry": "Ввести passphrase заново?",
         "rec_recovered": "Секрет восстановлен!",
-        "rec_failed": "Пока не удаётся восстановить.",
-        "rec_pp_ask1": "Если при создании бэкапа использовался passphrase,",
-        "rec_pp_ask2": "введите его. Если passphrase не было — нажмите Enter.",
-        "rec_pp_prompt": "Passphrase (Enter = нет):",
         "rec_reasons": "Всё ещё не удаётся. Возможные причины:",
         "rec_reason1": "• Недостаточно долей (нужно T штук)",
         "rec_reason2": "• Неверный passphrase",
         "rec_reason3": "• Опечатки в долях",
         "rec_reason4": "• Доли из разных бэкапов",
         "rec_continue": "Продолжить ввод долей?",
+        "rec_aborted": "Восстановление прервано. Секреты удалены из памяти.",
         "rec_fp_intro1": "На каждом листе долей записан fingerprint секрета.",
         "rec_fp_intro2": "Введите его для проверки (Enter = пропустить):",
         "rec_fp_prompt": "Fingerprint:",
@@ -426,13 +477,15 @@ TRANSLATIONS = {
         "test_generating": "Генерация тестового секрета...",
         "test_splitting": "Разделение {threshold}-of-{total} (до минуты)...",
         "test_split_error": "Ошибка разделения: {err}",
-        "test_1": "Тест 1: первые {threshold} долей",
-        "test_2": "Тест 2: последние {threshold} долей",
-        "test_3": "Тест 3: случайные {threshold} долей",
-        "test_4": "Тест 4: все {total} долей",
-        "test_5": "Тест 5: {count} долей (должно отказать)",
+        "test_1": "Тест 1: доли №1-{threshold}",
+        "test_2": "Тест 2: доли №{start}-{end}",
+        "test_3": "Тест 3: случайные доли ({threshold} шт.)",
+        "test_4": "Тест 4: все {total} шт. сразу",
+        "test_5": "Тест 5: {count} шт. (должно отказать)",
         "test_6": "Тест 6: неверный passphrase (не должен совпасть)",
         "test_7": "Тест 7: воспроизводимость fingerprint",
+        "test_8": "Тест 8: доли в обратном порядке ({threshold} шт.)",
+        "test_9": "Тест 9: лишние доли, порог определяется автоматически",
         "test_exc": "исключение — {err}",
         "test_result": "РЕЗУЛЬТАТ: {passed} из {total} тестов пройдено",
         "test_all_ok": "ВСЕ ТЕСТЫ ПРОЙДЕНЫ",
@@ -483,11 +536,7 @@ def set_language(code):
 
 
 def t(key, **kwargs):
-    """Translate a key with optional {placeholders}.
-
-    Falls back to English if the key is missing from the active
-    language (and to the key itself as a last resort).
-    """
+    """Translate a key with optional {placeholders}."""
     source = TEXT if key in TEXT else TRANSLATIONS["en"]
     s = source.get(key, key)
     return s.format(**kwargs) if kwargs else s
@@ -677,7 +726,7 @@ def secret_fingerprint(entropy_bytes):
 
 
 def get_passphrase():
-    """Ask for an optional SLIP-39 passphrase."""
+    """Ask for an optional SLIP-39 passphrase (used when splitting)."""
     print()
     print("  " + t("pp_intro1"))
     print("  " + t("pp_intro2"))
@@ -725,12 +774,133 @@ def split_entropy(entropy_bytes, threshold, total, passphrase=b""):
     return result[0] if result else []
 
 
-def try_combine(shares, passphrase):
-    """combine_mnemonics without exceptions. Returns bytes or None."""
+def _valid_threshold(text):
+    """Parse a threshold string, returning None if out of range."""
     try:
-        return combine_mnemonics(shares, passphrase=passphrase)
-    except Exception:
+        value = int(text)
+    except (TypeError, ValueError):
         return None
+    return value if 1 <= value <= MAX_SHARES else None
+
+
+def _threshold_from_error(exc):
+    """Extract the share threshold from a combine_mnemonics error.
+
+    The reference library raises e.g.
+    'Wrong number of mnemonics. Expected 4 mnemonics starting with
+    "...", but 10 were provided.' when more shares than the threshold
+    are given. This message is produced before the slow passphrase
+    KDF and works across library versions.
+    """
+    m = _EXPECTED_COUNT_RE.search(str(exc))
+    return _valid_threshold(m.group(1)) if m else None
+
+
+def probe_share(share):
+    """Validate one share and extract its parameters (no KDF).
+
+    Strategy: combine_mnemonics() verifies share checksums and headers
+    during preprocessing — BEFORE the slow passphrase KDF — and always
+    rejects a lone share of a T>=2 set with a "Wrong number of
+    mnemonics ... Expected T ..." error. We use that to validate the
+    share text and to learn the threshold T. With shamir-mnemonic
+    >= 1.3.0 the reference decoder is used instead.
+
+    Returns (is_valid, threshold, group_index, member_index,
+             identifier, error_message); anything unknown is None.
+    """
+    # Preferred: the reference decoder (shamir-mnemonic >= 1.3.0).
+    if _decode_mnemonic is not None:
+        try:
+            info = _decode_mnemonic(share)
+            return (True,
+                    getattr(info, "member_threshold", None),
+                    getattr(info, "group_index", None),
+                    getattr(info, "member_index", None),
+                    getattr(info, "identifier", None),
+                    None)
+        except Exception:
+            pass  # fall through to the message-based probe
+
+    try:
+        combine_mnemonics([share], passphrase=b"")
+        # A share that combines alone is a 1-of-1 backup.
+        return True, 1, None, None, None, None
+    except Exception as e:
+        msg = str(e)
+        m = _EXPECTED_COUNT_RE.search(msg)
+        if m:
+            return True, _valid_threshold(m.group(1)), None, None, None, None
+        lower = msg.lower()
+        if ("checksum" in lower or "wordlist" in lower
+                or "invalid mnemonic" in lower):
+            # The share text itself is broken (typo / unknown word).
+            return False, None, None, None, None, msg
+        if "insufficient" in lower:
+            # Fewer shares than required: the share itself parsed fine.
+            return True, None, None, None, None, None
+        # Unrecognized error: accept optimistically; real problems
+        # will surface during the actual recovery attempt.
+        return True, None, None, None, None, msg
+
+
+def try_combine(shares, passphrase, threshold=None):
+    """Recover the master secret from shares, tolerating extra shares.
+
+    The reference combine_mnemonics() accepts EXACTLY `threshold`
+    shares per group, so when more shares are available we must select
+    a T-sized subset ourselves. The threshold may be supplied by the
+    caller, learned from the library's error message, or discovered by
+    scanning subset sizes (wrong sizes are rejected during
+    preprocessing, before the slow KDF).
+
+    Returns entropy bytes or None.
+    """
+    if not shares:
+        return None
+
+    if threshold is not None:
+        # Fast path: the count is known to match (or not match) the
+        # threshold. Invalid/out-of-range T values are rejected.
+        if threshold < 1 or threshold > len(shares):
+            return None
+        if threshold == len(shares):
+            try:
+                return combine_mnemonics(list(shares), passphrase=passphrase)
+            except Exception:
+                return None
+        # More shares than needed: select T-sized subsets below.
+    else:
+        # Try the set exactly as provided (succeeds when its size
+        # happens to equal the threshold).
+        try:
+            return combine_mnemonics(list(shares), passphrase=passphrase)
+        except Exception as e:
+            threshold = _threshold_from_error(e)
+
+    if threshold is None:
+        # Threshold unknown: scan subset sizes ASCENDING. Wrong sizes
+        # fail instantly during preprocessing, so the whole scan costs
+        # at most one slow KDF attempt (at the correct size).
+        for size in range(2, len(shares)):
+            try:
+                return combine_mnemonics(shares[:size], passphrase=passphrase)
+            except Exception:
+                continue
+        return None
+
+    # Threshold known, more shares than needed: any T of them
+    # reconstruct the same encrypted secret, so the first subset
+    # normally succeeds. The cap bounds wrong-passphrase retries.
+    attempts = 0
+    for subset in combinations(shares, threshold):
+        try:
+            return combine_mnemonics(list(subset), passphrase=passphrase)
+        except Exception:
+            attempts += 1
+            if attempts >= MAX_DECRYPT_ATTEMPTS:
+                break
+    return None
 
 
 # ============================================================
@@ -738,11 +908,7 @@ def try_combine(shares, passphrase):
 # ============================================================
 
 def _render_words(words, per_line=4):
-    """Render words as a numbered grid: '1. word' per cell.
-
-      1. abandon    2. ability    3. able      4. about
-      5. above      6. absent     7. absurd    8. access
-    """
+    """Render words as a numbered grid: '1. word' per cell."""
     lines = []
     for i in range(0, len(words), per_line):
         chunk = words[i:i + per_line]
@@ -910,21 +1076,17 @@ def generate_new_backup():
     if not confirm_privacy():
         return
 
-    # Generation
     print()
     print("  " + t("new_generating"))
     mnemonic = generate_seed()
     entropy = bytearray(mnemonic_to_entropy(mnemonic))
     fingerprint = secret_fingerprint(bytes(entropy))
 
-    # Show the seed phrase
     display_seed_phrase(mnemonic, fingerprint)
 
-    # Scheme and passphrase
     threshold, total = _choose_scheme()
     passphrase = get_passphrase()
 
-    # Split
     clear_screen()
     print("  " + t("splitting", threshold=threshold, total=total))
     print("  " + t("splitting_slow"))
@@ -940,11 +1102,9 @@ def generate_new_backup():
         purge_memory()
         return
 
-    # Show shares one at a time
     for index, share in enumerate(shares, start=1):
         display_share(share, index, total, threshold, fingerprint)
 
-    # Automatic verification
     clear_screen()
     print_header(t("verify_title"))
     print()
@@ -959,7 +1119,6 @@ def generate_new_backup():
     input("  " + t("finish_enter"))
     clear_screen()
 
-    # Cleanup
     wipe(entropy)
     mnemonic = None
     shares = None
@@ -979,7 +1138,6 @@ def split_existing_mnemonic():
     if not confirm_privacy():
         return
 
-    # Input (hidden, twice)
     print()
     print("  " + t("split_intro1"))
     print("  " + t("split_intro2"))
@@ -987,7 +1145,6 @@ def split_existing_mnemonic():
 
     mnemonic = get_hidden_confirmed("  " + t("seed_prompt"))
 
-    # Validation
     print()
     print("  " + t("checking"))
 
@@ -1061,20 +1218,68 @@ def recover_seed():
     print("  " + t("rec_intro2"))
     print("  " + t("rec_intro3"))
     print("  " + t("rec_intro4"))
-    print("  " + t("rec_intro5"))
+    print()
+
+    # Ask about the passphrase UP FRONT, so the user is never stuck.
+    if ask_yes_no("  " + t("rec_pp_used"), default=False):
+        pp = get_hidden("  " + t("rec_pp_prompt") + " ")
+        passphrase = pp.encode("utf-8") if pp else b""
+        pp = None
+    else:
+        passphrase = b""
+
     print()
 
     shares = []
-    seen = set()
-    passphrase = b""
-    entropy_bytes = None
+    seen_texts = set()   # exact-text dedup (always active)
+    slots = set()        # (identifier, group, member) dedup (if known)
+    identifier = None
+    threshold = None     # learned from the shares themselves
+    result = None
+
+    def attempt():
+        """Try to recover with everything collected so far."""
+        if not shares:
+            return None
+        return try_combine(shares, passphrase, threshold)
+
+    def cleanup_state():
+        """Drop all recovery state (used on abort)."""
+        nonlocal shares, passphrase, seen_texts, slots, identifier, threshold
+        shares = None
+        passphrase = None
+        seen_texts = None
+        slots = None
+        identifier = None
+        threshold = None
+        purge_memory()
 
     while True:
-        # Try to recover with the shares collected so far
-        if shares:
-            entropy_bytes = try_combine(shares, passphrase)
-            if entropy_bytes is not None:
-                break
+        # Try to recover with the shares collected so far.
+        result = attempt()
+        if result is not None:
+            break
+
+        # Enough distinct shares but decryption fails: almost
+        # certainly a wrong passphrase.
+        if threshold is not None and len(shares) >= threshold:
+            print()
+            print("  " + t("rec_pp_suspect_title"))
+            print("  " + t("rec_pp_suspect_hint"))
+            print()
+            if ask_yes_no("  " + t("rec_pp_retry"), default=True):
+                pp = get_hidden("  " + t("rec_pp_prompt") + " ")
+                passphrase = pp.encode("utf-8") if pp else b""
+                pp = None
+                result = attempt()
+                if result is not None:
+                    break
+            if not ask_yes_no("  " + t("rec_continue"), default=False):
+                cleanup_state()
+                print("  " + t("rec_aborted"))
+                print()
+                return
+            # The user wants to add more shares (suspects typos).
 
         print("  " + t("rec_share_header", num=len(shares) + 1))
         share = input("  " + t("rec_share_prompt") + " ").strip()
@@ -1086,51 +1291,71 @@ def recover_seed():
                 print()
                 continue
 
-            entropy_bytes = try_combine(shares, passphrase)
-            if entropy_bytes is not None:
-                break
-
-            # Ask for the passphrase (if one was used)
+            # Empty input: offer passphrase change / more shares / exit
             print()
-            print("  " + t("rec_failed"))
-            print("  " + t("rec_pp_ask1"))
-            print("  " + t("rec_pp_ask2"))
-            print()
-            pp = get_hidden("  " + t("rec_pp_prompt") + " ")
-            passphrase = pp.encode("utf-8") if pp else b""
-
-            entropy_bytes = try_combine(shares, passphrase)
-            if entropy_bytes is not None:
-                break
-
-            print()
+            if ask_yes_no("  " + t("rec_pp_retry"), default=False):
+                pp = get_hidden("  " + t("rec_pp_prompt") + " ")
+                passphrase = pp.encode("utf-8") if pp else b""
+                pp = None
+                result = attempt()
+                if result is not None:
+                    break
             print("  " + t("rec_reasons"))
-            print("  " + t("rec_reason1"))
-            print("  " + t("rec_reason2"))
-            print("  " + t("rec_reason3"))
-            print("  " + t("rec_reason4"))
+            for k in (1, 2, 3, 4):
+                print("  " + t("rec_reason%d" % k))
             print()
             if not ask_yes_no("  " + t("rec_continue"), default=True):
-                shares = None
-                passphrase = None
-                seen = None
-                purge_memory()
+                cleanup_state()
+                print("  " + t("rec_aborted"))
+                print()
                 return
             continue
 
-        if share in seen:
+        if share in seen_texts:
             print("  " + t("rec_dup"))
             print()
             continue
 
-        seen.add(share)
+        # Immediate structural validation of the entered share.
+        ok, thr, group_index, member_index, share_id, err = probe_share(share)
+
+        if not ok:
+            print("  ✗ " + t("rec_invalid_share", err=err))
+            print()
+            continue
+
+        if thr is not None:
+            if threshold is None:
+                threshold = thr
+            elif thr != threshold:
+                print("  ⚠  " + t("rec_mixed"))
+                print()
+        if share_id is not None:
+            if identifier is not None and share_id != identifier:
+                print("  ⚠  " + t("rec_foreign"))
+                print()
+            identifier = share_id
+        if group_index is not None and member_index is not None:
+            slot = (share_id, group_index, member_index)
+            if slot in slots:
+                print("  " + t("rec_dup_slot", member=member_index + 1))
+                print()
+                continue
+            slots.add(slot)
+
+        seen_texts.add(share)
         shares.append(share)
-        print("  ✓ " + t("rec_accepted", count=len(shares)))
+
+        if threshold is not None:
+            print("  ✓ " + t("rec_status",
+                             have=len(shares), need=threshold))
+        else:
+            print("  ✓ " + t("rec_accepted", count=len(shares)))
         print()
 
     # Recovered
-    entropy = bytearray(entropy_bytes)
-    entropy_bytes = None
+    entropy = bytearray(result)
+    result = None
     print()
     print("  ✓ " + t("rec_recovered"))
     print()
@@ -1168,9 +1393,7 @@ def recover_seed():
     except Exception as e:
         print("  ✗ " + t("rec_convert_error", err=e))
         wipe(entropy)
-        shares = None
-        passphrase = None
-        purge_memory()
+        cleanup_state()
         return
 
     if fp_ok:
@@ -1183,10 +1406,7 @@ def recover_seed():
     clear_screen()
     wipe(entropy)
     mnemonic = None
-    shares = None
-    passphrase = None
-    seen = None
-    purge_memory()
+    cleanup_state()
 
     print("  " + t("memory_cleared"))
     print()
@@ -1228,23 +1448,30 @@ def test_recovery():
     print(f"  Fingerprint: {fp}")
     print()
 
+    # Test 1: the first T shares (exact count)
     check(t("test_1", threshold=threshold),
           lambda: combine_mnemonics(shares[:threshold], passphrase=b"")
           == bytes(entropy))
 
-    check(t("test_2", threshold=threshold),
+    # Test 2: the last T shares (exact count)
+    last_start = total - threshold + 1
+    check(t("test_2", start=last_start, end=total),
           lambda: combine_mnemonics(shares[-threshold:], passphrase=b"")
           == bytes(entropy))
 
+    # Test 3: random T shares (exact count)
     sample = random.sample(shares, threshold)
     check(t("test_3", threshold=threshold),
           lambda: combine_mnemonics(sample, passphrase=b"") == bytes(entropy))
 
+    # Test 4: ALL N shares at once — the robust recovery path must
+    # select a valid T-subset automatically (this is what users do).
     check(t("test_4", total=total),
-          lambda: combine_mnemonics(shares, passphrase=b"") == bytes(entropy))
+          lambda: try_combine(shares, b"", threshold=threshold)
+          == bytes(entropy))
 
+    # Test 5: T-1 shares must be rejected
     def test_insufficient():
-        """T-1 shares must be rejected."""
         try:
             combine_mnemonics(shares[:threshold - 1], passphrase=b"")
             return False   # recovery succeeded — that is a bug
@@ -1252,17 +1479,31 @@ def test_recovery():
             return True
     check(t("test_5", count=threshold - 1), test_insufficient)
 
+    # Test 6: a wrong passphrase must not yield the original secret
     def test_wrong_passphrase():
-        """A wrong passphrase must not yield the original secret."""
-        result = try_combine(shares[:threshold], b"wrong-passphrase-test")
-        if result is None:
-            return True                     # rejected outright
-        return result != bytes(entropy)     # or produced different bytes
+        result = try_combine(shares[:threshold], b"wrong-passphrase-test",
+                             threshold=threshold)
+        return result is None or result != bytes(entropy)
     check(t("test_6"), test_wrong_passphrase)
 
+    # Test 7: fingerprint reproducibility
     check(t("test_7"),
           lambda: secret_fingerprint(
               combine_mnemonics(shares[:threshold], passphrase=b"")) == fp)
+
+    # Test 8: T shares in reverse order (order must not matter)
+    reversed_shares = list(reversed(shares[:threshold]))
+    check(t("test_8", threshold=threshold),
+          lambda: combine_mnemonics(reversed_shares, passphrase=b"")
+          == bytes(entropy))
+
+    # Test 9: extra shares WITHOUT telling the program the threshold —
+    # it must discover the right subset on its own (the scenario that
+    # failed in v3.2 on library versions without the share decoder).
+    if threshold < total:
+        extra = shares[:threshold] + [shares[-1]]
+        check(t("test_9"),
+              lambda: try_combine(extra, b"") == bytes(entropy))
 
     print()
     print("  " + "═" * 50)
@@ -1482,8 +1723,7 @@ def main():
               file=sys.stderr)
         sys.exit(1)
 
-    # stdout redirect warning (bilingual — language not selected yet);
-    # printed to stderr so the user actually sees it
+    # stdout redirect warning (bilingual — language not selected yet)
     if not sys.stdout.isatty():
         print("=" * 60, file=sys.stderr)
         print("WARNING: stdout is redirected! Secrets may be written to a file.",
