@@ -41,15 +41,16 @@ Example: a 3-of-5 backup means any 3 of the 5 shares recover the seed. Lose up t
 
 Requires Python 3.8+.
 
-pip install -r requirements.txt
-python3 shamir_seed_lab.py
+`pip install -r requirements.txt`
+
+`python3 shamir_seed_lab.py`
 
 Tails / air-gapped machines
 
 The tool needs the two libraries only at runtime. On Tails you can install them in a session (non-persistent):
 
-python3 -m pip install --user mnemonic shamir-mnemonic
-python3 shamir_seed_lab.py
+`python3 -m pip install --user mnemonic shamir-mnemonic`
+`python3 shamir_seed_lab.py`
 
 For persistence, keep the project in the Persistent Storage and install the libraries into a virtual environment there.
 🖥️ Usage
