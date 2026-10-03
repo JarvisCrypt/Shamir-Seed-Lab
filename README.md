@@ -52,7 +52,7 @@ python3 -m pip install --user mnemonic shamir-mnemonicpython3 shamir_seed_lab.py
 For persistence, keep the project in the Persistent Storage and install the libraries into a virtual environment there.
 🖥️ Usage
 
- $ python3 shamir_seed_lab.py  Language / Язык  1. English  2. Русский  ╔════════════════════════════════════════════════════════╗  ║                 Shamir Seed Lab  v3.1                  ║  ╚════════════════════════════════════════════════════════╝  ──────────────────────────────────────────   1. Create a new seed phrase and backup   2. Split an existing seed phrase   3. Recover a seed from shares   4. Run the automatic test   5. Check environment   6. Exit  ──────────────────────────────────────────
+ $ python3 shamir_seed_lab.py  Language / Язык  1. English  2. Русский  ╔════════════════════════════════════════════════════════╗  ║                 Shamir Seed Lab  v3.3                  ║  ╚════════════════════════════════════════════════════════╝  ──────────────────────────────────────────   1. Create a new seed phrase and backup   2. Split an existing seed phrase   3. Recover a seed from shares   4. Run the automatic test   5. Check environment   6. Exit  ──────────────────────────────────────────
 
 Recommended first step: run option 4 (self-test) after installation and option 5 (environment check) before working with real secrets.
 Recovery workflow
