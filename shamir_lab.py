@@ -17,27 +17,31 @@ Security design principles:
   * Environment checks (swap, core dumps, network, redirection)
   * No network access, no shell calls, no files written
 
-Recovery design (v3.4):
-  * The passphrase is requested up front and can be re-entered if
-    decryption fails.
-  * Any number of shares (>= threshold) may be entered. The reference
-    combine_mnemonics() requires EXACTLY T shares per group, so this
-    tool selects a valid T-subset itself, in three phases:
-      Phase 1 - the whole set as entered (works when count == T,
-                otherwise the library's "Expected N mnemonics" error
-                reveals T);
-      Phase 2 - T-sized subsets: first T, last T, then all in order;
-      Phase 3 - candidate thresholds discovered by probing each share
-                individually (a single T>=2 share always fails the
-                count check *before* the slow KDF, naming its T),
-                then subsets of those sizes.
-  * Cheap failures (wrong subset size, rejected during preprocessing,
-    before the passphrase KDF) never consume the expensive-attempt
-    budget, so unusable combinations cannot starve the usable ones.
-  * Each entered share is structurally validated immediately:
-    word count (20/23/27/30/33) and SLIP-39 wordlist membership.
-  * If the library's error wording ever changes, Phase 1/2 degrade
-    gracefully and Phase 3 still discovers the right subsets.
+Recovery design (v3.6):
+  * Shares are grouped by backup identifier, which is parsed from the
+    first 15 bits of the share (word 1 + top 5 bits of word 2). This
+    is the only header field interpreted from raw bits: its position
+    is stable and backed by observed library behaviour.
+  * The member threshold and member index are deliberately NOT
+    parsed from bits (a previous version got that layout wrong).
+    Instead, the library's own count error ("Wrong number of
+    mnemonics. Expected N mnemonics ..."), which is raised during
+    preprocessing — BEFORE the slow passphrase KDF — is used as the
+    source of truth for the threshold.
+  * Phase 0 (per identifier bucket): combine the whole bucket; a
+    count error reveals T, then the first T shares are combined. A
+    post-KDF failure on a structurally sufficient set means the
+    passphrase is wrong. If the bucket fails with a cheap non-count
+    error (e.g. one corrupted share inside), each share is left out
+    in turn (leave-one-out).
+  * Phases 1-3 (fallback, e.g. when the wordlist is unavailable):
+    whole-set attempt, T-sized subset scan, then candidate
+    thresholds discovered by single-share probes. Only post-KDF
+    failures consume the expensive-attempt budget.
+  * The parser is an optimization only: an error in it can slow
+    recovery down, but can never produce a wrong secret (the
+    library's RS1024 checksum, the BIP-39 checksum and the user's
+    fingerprint verification remain the final gates).
 
 Dependencies (reference implementations by SatoshiLabs):
   pip install mnemonic shamir-mnemonic
@@ -58,38 +62,28 @@ from itertools import combinations
 from mnemonic import Mnemonic
 from shamir_mnemonic import generate_mnemonics, combine_mnemonics
 
-# Optional share decoder from newer versions of the reference package
-# (provides identifier / group / member info for nicer diagnostics).
-# All core functionality works without it.
+# SLIP-39 wordlist, resolved defensively:
+#   1) the reference module's WORDLIST (a plain list, ordered),
+#   2) wordlist.txt shipped inside the package.
+# The ordered list enables header parsing; the set enables fast
+# word-membership checks. If neither works, both stay None and the
+# program falls back to library-error-driven recovery.
+_SLIP39_WORDS = None    # ordered list of 1024 words
+_SLIP39_WORDSET = None  # frozenset for membership tests
 try:
-    from shamir_mnemonic.share import decode_mnemonic as _decode_mnemonic
-except ImportError:
-    try:
-        from shamir_mnemonic import decode_mnemonic as _decode_mnemonic
-    except ImportError:
-        _decode_mnemonic = None
-
-# SLIP-39 wordlist for input validation, resolved defensively:
-#   1) package-level export, 2) the shamir module, 3) wordlist.txt
-# shipped inside the package. If none works, the word check is
-# simply skipped (the library still rejects bad shares at combine).
-_SLIP39_WORDSET = None
-try:
-    try:
-        from shamir_mnemonic import WORDLIST as _wordlist
-    except ImportError:
-        from shamir_mnemonic.shamir import WORDLIST as _wordlist
-    _SLIP39_WORDSET = frozenset(w.strip() for w in _wordlist)
+    from shamir_mnemonic.shamir import WORDLIST as _wordlist
+    _SLIP39_WORDS = list(_wordlist)
 except Exception:
     try:
         import shamir_mnemonic as _sm_package
         _wl_path = os.path.join(
             os.path.dirname(_sm_package.__file__), "wordlist.txt")
         with open(_wl_path, "r", encoding="utf-8") as _f:
-            _SLIP39_WORDSET = frozenset(
-                line.strip() for line in _f if line.strip())
+            _SLIP39_WORDS = [line.strip() for line in _f if line.strip()]
     except Exception:
-        _SLIP39_WORDSET = None
+        _SLIP39_WORDS = None
+if _SLIP39_WORDS is not None:
+    _SLIP39_WORDSET = frozenset(_SLIP39_WORDS)
 
 
 # ============================================================
@@ -97,28 +91,29 @@ except Exception:
 # ============================================================
 
 APP_NAME = "Shamir Seed Lab"
-APP_VERSION = "3.4"
+APP_VERSION = "3.6"
 WORDLIST_LANGUAGE = "english"   # BIP-39 wordlist (not the UI language)
 BIP39_STRENGTH = 256            # 24 words
 MAX_SHARES = 16                 # SLIP-39 maximum per group
 ITERATION_EXPONENT = 2          # PBKDF2: 10000 * 2^2 = 40000 iterations
 
 # combine_mnemonics() raises "Wrong number of mnemonics. Expected N
-# mnemonics ..." when the subset size is wrong. That check happens
-# BEFORE the slow passphrase KDF, which makes such failures cheap and
-# makes the message the version-independent way to learn the threshold.
+# mnemonics ..." when the subset size is wrong — BEFORE the slow
+# passphrase KDF. This is the version-independent source of truth
+# for the member threshold.
 _EXPECTED_COUNT_RE = re.compile(r"Expected (\d+) mnemonics?")
 
 # Valid SLIP-39 mnemonic lengths (words) for master secrets of
 # 16/20/24/28/32 bytes: 20, 23, 27, 30, 33.
 VALID_SHARE_WORD_COUNTS = frozenset((20, 23, 27, 30, 33))
 
-# Budget of expensive (KDF-consuming) combine failures allowed per
-# subset size. Cheap count-failures do not consume it.
+# Budget of expensive (post-KDF) combine failures per subset size.
+# Preprocessing failures (wrong count, identifier mismatch, share
+# checksum) do NOT consume it — they cost microseconds.
 KDF_ATTEMPT_BUDGET = 16
 
-# Hard cap on the total number of combine calls in the subset phases,
-# bounding the worst case for heavily mixed share sets.
+# Hard cap on the total number of combine calls in the fallback
+# subset phases, bounding the worst case for heavily mixed sets.
 MAX_SCAN_CALLS = 400
 
 
@@ -260,9 +255,7 @@ TRANSLATIONS = {
         "rec_share_prompt": "Enter share (or press Enter for options):",
         "rec_first": "Enter at least one share first.",
         "rec_dup": "This share has already been entered. Enter a different one.",
-        "rec_dup_slot": "Share #{member} of this set has already been entered. Enter a different share.",
         "rec_foreign": "This share belongs to a DIFFERENT backup (different identifier). Do not mix shares from different backups!",
-        "rec_mixed": "This share's parameters differ from the previously entered ones — it is likely from a DIFFERENT backup. Do not mix shares from different backups!",
         "rec_invalid_share": "This is not a valid share: {err}",
         "rec_share_bad_length": "Not a valid share: expected 20, 23, 27, 30 or 33 words, got {count}.",
         "rec_share_bad_words": "Not a valid share: it contains words that are not in the SLIP-39 wordlist.",
@@ -311,7 +304,11 @@ TRANSLATIONS = {
         "test_9": "Test 9: extra shares, threshold auto-detected",
         "test_10": "Test 10: a foreign share mixed in",
         "test_11": "Test 11: input normalization (case, spacing)",
+        "test_12": "Test 12: identifier parsing + threshold discovery (cross-checked)",
+        "test_13": "Test 13: shares of two backups mixed together",
         "test_exc": "exception — {err}",
+        "test_skip": "skipped ({reason})",
+        "test_skip_no_wordlist": "SLIP-39 wordlist unavailable",
         "test_result": "RESULT: {passed} of {total} tests passed",
         "test_all_ok": "ALL TESTS PASSED",
         "test_failed": "SOME TESTS FAILED!",
@@ -483,9 +480,7 @@ TRANSLATIONS = {
         "rec_share_prompt": "Введите долю (или Enter — опции):",
         "rec_first": "Сначала введите хотя бы одну долю.",
         "rec_dup": "Эта доля уже введена. Введите другую.",
-        "rec_dup_slot": "Доля №{member} из этого набора уже введена. Введите другую долю.",
         "rec_foreign": "Эта доля принадлежит ДРУГОМУ бэкапу (другой идентификатор). Не смешивайте доли из разных бэкапов!",
-        "rec_mixed": "Параметры этой доли отличаются от введённых ранее — вероятно, это доля из ДРУГОГО бэкапа. Не смешивайте доли из разных бэкапов!",
         "rec_invalid_share": "Это некорректная доля: {err}",
         "rec_share_bad_length": "Некорректная доля: ожидалось 20, 23, 27, 30 или 33 слова, получено {count}.",
         "rec_share_bad_words": "Некорректная доля: содержит слова, которых нет в списке слов SLIP-39.",
@@ -534,7 +529,11 @@ TRANSLATIONS = {
         "test_9": "Тест 9: лишние доли, порог определяется автоматически",
         "test_10": "Тест 10: посторонняя доля в наборе",
         "test_11": "Тест 11: нормализация ввода (регистр, пробелы)",
+        "test_12": "Тест 12: парсер идентификатора + определение порога (сверка с библиотекой)",
+        "test_13": "Тест 13: доли двух бэкапов вперемешку",
         "test_exc": "исключение — {err}",
+        "test_skip": "пропущен ({reason})",
+        "test_skip_no_wordlist": "SLIP-39 wordlist недоступен",
         "test_result": "РЕЗУЛЬТАТ: {passed} из {total} тестов пройдено",
         "test_all_ok": "ВСЕ ТЕСТЫ ПРОЙДЕНЫ",
         "test_failed": "ЕСТЬ ПРОВАЛЕННЫЕ ТЕСТЫ!",
@@ -716,7 +715,13 @@ def ask_yes_no(prompt, default=True):
 
 
 def get_hidden(prompt):
-    """Hidden input (getpass) with a visible fallback."""
+    """Hidden input (getpass) with a visible fallback.
+
+    Note: the value is stripped of leading/trailing whitespace. This
+    is applied symmetrically when splitting AND when recovering, so
+    existing backups stay compatible — but a passphrase whose first
+    or last character is a space is effectively shortened.
+    """
     try:
         value = getpass.getpass(prompt)
     except Exception:
@@ -726,13 +731,19 @@ def get_hidden(prompt):
 
 
 def get_hidden_confirmed(prompt):
-    """Hidden input, entered twice for confirmation."""
+    """Hidden input, entered twice for confirmation (mnemonic input).
+
+    Both entries are normalized (case, spacing) BEFORE comparison,
+    so a pasted phrase and a typed confirmation match regardless of
+    formatting artifacts.
+    """
     while True:
-        value = get_hidden(prompt + ": ")
+        value = normalize_phrase(get_hidden(prompt + ": "))
         if not value:
             print("  " + t("input_empty"))
             continue
-        confirm = get_hidden(prompt + " " + t("input_repeat") + ": ")
+        confirm = normalize_phrase(
+            get_hidden(prompt + " " + t("input_repeat") + ": "))
         if value == confirm:
             return value
         print("  " + t("input_mismatch"))
@@ -835,6 +846,70 @@ def split_entropy(entropy_bytes, threshold, total, passphrase=b""):
     return result[0] if result else []
 
 
+# ============================================================
+# Share header parsing (identifier only — no layout guessing)
+# ============================================================
+
+def _parse_share_header(share):
+    """Parse the backup identifier from the first words of a share.
+
+    ONLY the identifier is extracted: the first 15 bits of the share
+    stream (word 1 plus the top 5 bits of word 2). Its position is
+    stable across library versions and backed by observed behaviour
+    (a single-group share's 3rd word is the zero-index word
+    "academic", proving big-endian packing and that the first 20
+    bits are the identifier and iteration exponent).
+
+    The member threshold / member index bits are deliberately NOT
+    interpreted: a previous version got that layout wrong, so the
+    library's own count errors are used as the source of truth
+    instead (see _bucket_attempt and _threshold_from_error).
+
+    Returns {"identifier": int} or None (wordlist unavailable or
+    unknown words).
+    """
+    if _SLIP39_WORDS is None:
+        return None
+    words = share.split()
+    if len(words) < 4:
+        return None
+    try:
+        w0 = _SLIP39_WORDS.index(words[0])
+        w1 = _SLIP39_WORDS.index(words[1])
+    except ValueError:
+        return None
+    identifier = (w0 << 5) | (w1 >> 5)
+    return {"identifier": identifier}
+
+
+def probe_share(share):
+    """Validate one share textually (no library calls, no KDF).
+
+    1) word count must be 20/23/27/30/33 (SLIP-39 lengths for
+       16/20/24/28/32-byte secrets; also rejects pasted BIP-39
+       phrases and truncated pastes);
+    2) every word must be in the SLIP-39 wordlist (if loaded);
+    3) the header is parsed for the backup identifier.
+
+    Returns (ok, header_or_None, err_code, err_detail).
+    err_code: None | "length" | "words".
+    """
+    words = share.split()
+
+    if len(words) not in VALID_SHARE_WORD_COUNTS:
+        return (False, None, "length", len(words))
+
+    if _SLIP39_WORDSET is not None:
+        if any(w not in _SLIP39_WORDSET for w in words):
+            return (False, None, "words", None)
+
+    return (True, _parse_share_header(share), None, None)
+
+
+# ============================================================
+# Share combination
+# ============================================================
+
 def _valid_threshold(text):
     """Parse a threshold string, returning None if out of range."""
     try:
@@ -849,110 +924,151 @@ def _threshold_from_error(exc):
 
     The reference library raises e.g.
     'Wrong number of mnemonics. Expected 4 mnemonics starting with
-    "...", but 10 were provided.' when the subset size is wrong.
-    This check runs before the slow passphrase KDF, which is what
-    makes such failures cheap and the threshold discoverable.
+    "...", but 10 were provided.' when the subset size is wrong —
+    BEFORE the slow passphrase KDF. This makes the threshold
+    discoverable cheaply and version-independently.
     """
     m = _EXPECTED_COUNT_RE.search(str(exc))
     return _valid_threshold(m.group(1)) if m else None
 
 
-def _is_cheap_failure(exc):
-    """True when the failure is a wrong-subset-size (preprocessing).
+def _is_expensive_failure(exc):
+    """True ONLY for post-KDF failures: wrong passphrase or padding.
 
-    Cheap failures occur before the passphrase KDF and therefore do
-    not consume the expensive-attempt budget.
+    Everything else (wrong subset count, identifier mismatch, share
+    checksum, group errors) is raised during preprocessing, before
+    the passphrase KDF, and costs microseconds.
     """
-    return _threshold_from_error(exc) is not None
+    msg = str(exc).lower()
+    return "digest" in msg or "padding" in msg
 
 
-def probe_share(share):
-    """Validate one share and extract its parameters (no KDF for T>=2).
+def _bucket_attempt(share_list, passphrase):
+    """Attempt recovery from one identifier bucket (one backup).
 
-    Structural checks first (word count, wordlist), then the optional
-    reference decoder, then a single-share combine probe: a share of a
-    T>=2 set always fails the count check BEFORE any key derivation,
-    and the error names its threshold T.
-
-    Returns (ok, threshold, group_index, member_index, identifier,
-             error_code, error_detail); unknown values are None.
-    error_code: None | "length" | "words" | "library".
+    Returns (result, learned_threshold):
+      result: bytes — recovered secret;
+              False — a structurally sufficient subset exists, but
+                      the passphrase failed to decrypt it;
+              None  — not enough shares / only cheap failures.
+      learned_threshold: the member threshold if a count error
+              revealed it, else None.
     """
-    words = share.split()
 
-    # Structural check 1: length. SLIP-39 mnemonics for 16/20/24/28/32
-    # byte secrets are 20/23/27/30/33 words. This also rejects pasted
-    # BIP-39 phrases (12-24 words) and truncated pastes.
-    if len(words) not in VALID_SHARE_WORD_COUNTS:
-        return (False, None, None, None, None, "length", len(words))
-
-    # Structural check 2: wordlist membership (if the wordlist was
-    # importable). Catches most typos immediately.
-    if _SLIP39_WORDSET is not None:
-        if any(w not in _SLIP39_WORDSET for w in words):
-            return (False, None, None, None, None, "words", None)
-
-    # Preferred: the reference decoder (shamir-mnemonic >= 1.3.0),
-    # which also provides identifier / group / member information.
-    if _decode_mnemonic is not None:
+    def try_set(lst):
+        """One combine call: ('ok', bytes) | ('count', T) |
+        ('expensive', None) | ('other', None)."""
         try:
-            info = _decode_mnemonic(share)
-            return (True,
-                    getattr(info, "member_threshold", None),
-                    getattr(info, "group_index", None),
-                    getattr(info, "member_index", None),
-                    getattr(info, "identifier", None),
-                    None, None)
-        except Exception:
-            pass  # fall through to the message-based probe
+            return ("ok", combine_mnemonics(list(lst), passphrase=passphrase))
+        except Exception as e:
+            thr = _threshold_from_error(e)
+            if thr is not None:
+                return ("count", thr)
+            if _is_expensive_failure(e):
+                return ("expensive", None)
+            return ("other", None)
 
-    try:
-        combine_mnemonics([share], passphrase=b"")
-        # A share that combines alone is a 1-of-1 backup.
-        return (True, 1, None, None, None, None, None)
-    except Exception as e:
-        thr = _threshold_from_error(e)
-        if thr is not None:
-            # Valid share of a T>=2 set; the error named its threshold.
-            return (True, thr, None, None, None, None, None)
-        if "checksum" in str(e).lower():
-            # Structurally plausible but the checksum is broken —
-            # a real typo. (A digest failure, by contrast, may mean a
-            # valid 1-of-1 share protected by a passphrase, so it is
-            # NOT treated as invalid here.)
-            return (False, None, None, None, None, "library", str(e))
-        # Unrecognized error: accept optimistically. A bad share can
-        # never combine, so this cannot produce a wrong secret — the
-        # fingerprint check remains the final safety net.
-        return (True, None, None, None, None, None, None)
+    def try_with_threshold(lst):
+        """Try lst as entered; if a count error reveals T and enough
+        shares are present, try the first T of them."""
+        status, payload = try_set(lst)
+        if status == "ok":
+            return payload, None
+        if status == "expensive":
+            return False, None          # exact count + wrong passphrase
+        if status == "count":
+            t = payload
+            if len(lst) >= t:
+                status2, payload2 = try_set(lst[:t])
+                if status2 == "ok":
+                    return payload2, t
+                if status2 == "expensive":
+                    return False, t
+            return None, t
+        return None, None               # cheap non-count failure
+
+    # 1) The bucket as entered.
+    result, learned = try_with_threshold(share_list)
+    if result is not None:
+        return result, learned
+
+    # Simply not enough shares yet — nothing more to try here.
+    if learned is not None and len(share_list) < learned:
+        return None, learned
+
+    # 2) Cheap non-count failure (e.g. one corrupted share or a
+    #    foreign-group share inside the bucket): leave one share out
+    #    at a time. All failures stay cheap until a structurally
+    #    valid subset is found, so this is bounded and fast.
+    for i in range(len(share_list)):
+        subset = share_list[:i] + share_list[i + 1:]
+        result, learned = try_with_threshold(subset)
+        if result is not None:
+            return result, learned
+    return None, learned
 
 
-def try_combine(shares, passphrase, threshold=None):
-    """Recover the master secret from shares, tolerating extras.
+def _try_combine_grouped(shares, passphrase):
+    """Phase 0: group shares by backup identifier, combine per bucket.
 
-    The reference combine_mnemonics() accepts EXACTLY T shares per
-    group, so subsets must be selected by the caller. Three phases:
+    Returns (result, learned_threshold). result: bytes | False |
+    None (see _bucket_attempt). Buckets are tried in entry order;
+    only if every complete bucket fails with a post-KDF error does
+    the search stop (the passphrase matches no recoverable backup
+    present among the entered shares).
+    """
+    headers = [_parse_share_header(s) for s in shares]
+    if any(h is None for h in headers):
+        return None, None      # parser unavailable -> fallback phases
 
-      Phase 1 - the whole set as entered. Succeeds when its size
-                equals T; otherwise the count error reveals T.
-      Phase 2 - T-sized subsets: first T, last T, then all in order.
-                (The first/last ordering survives a foreign or broken
-                share entered at either end.)
-      Phase 3 - candidate thresholds discovered by probing each share
-                individually (cheap, before the KDF), then subsets of
-                those sizes. Handles mixed sets from several backups
-                and a wrongly pinned threshold.
+    buckets = {}
+    for h, s in zip(headers, shares):
+        buckets.setdefault(h["identifier"], []).append(s)
 
-    Cheap failures (wrong subset size) never consume the KDF budget.
-    Returns entropy bytes or None.
+    any_complete_failure = False
+    learned = None
+    for bucket in buckets.values():
+        result, t = _bucket_attempt(bucket, passphrase)
+        if learned is None and t is not None:
+            learned = t
+        if isinstance(result, (bytes, bytearray)):
+            return bytes(result), learned
+        if result is False:
+            any_complete_failure = True
+    if any_complete_failure:
+        return False, learned
+    return None, learned
+
+
+def _combine_best_effort(shares, passphrase, threshold=None):
+    """Full recovery pipeline. Returns (result, learned_threshold).
+
+    Phase 0 - identifier grouping (library-driven threshold).
+    Phase 1 - the whole set as entered (fallback path).
+    Phase 2 - T-sized subsets: first T, last T, then all in order.
+    Phase 3 - candidate thresholds from single-share probes (cheap),
+              then subsets of those sizes.
+
+    Only post-KDF failures consume the expensive-attempt budget.
     """
     if not shares:
-        return None
+        return None, None
+
+    # --- Phase 0 ---
+    result, learned = _try_combine_grouped(shares, passphrase)
+    if learned is not None:
+        threshold = learned
+    if isinstance(result, (bytes, bytearray)):
+        return bytes(result), threshold
+    if result is False:
+        return None, threshold     # complete set + wrong passphrase
+
     k = len(shares)
 
-    # --- Phase 1: the whole set ---
+    # --- Phase 1: the whole set as entered ---
     try:
-        return combine_mnemonics(list(shares), passphrase=passphrase)
+        return combine_mnemonics(
+            list(shares), passphrase=passphrase), threshold
     except Exception as e:
         learned = _threshold_from_error(e)
         if learned is not None:
@@ -973,22 +1089,20 @@ def try_combine(shares, passphrase, threshold=None):
             if calls > MAX_SCAN_CALLS:
                 break
             try:
-                return combine_mnemonics(list(subset), passphrase=passphrase)
+                return combine_mnemonics(
+                    list(subset), passphrase=passphrase), threshold
             except Exception as e:
-                if not _is_cheap_failure(e):
+                if _is_expensive_failure(e):
                     budget -= 1
                     if budget <= 0:
                         break
-        # fall through to Phase 3 (mixed sets, wrong pin)
 
-    # --- Phase 3: candidate thresholds, discovered per share ---
-    # A single share of a T>=2 set always fails the count check before
-    # the KDF, so probing every share is cheap and names each one's T.
+    # --- Phase 3: candidate thresholds from single-share probes ---
     candidates = set()
     for s in shares:
         try:
             combine_mnemonics([s], passphrase=passphrase)
-            continue  # a 1-of-1 share: Phase 1 already covers k == 1
+            continue     # a 1-of-1 share; Phase 1 covers k == 1
         except Exception as e:
             thr = _threshold_from_error(e)
             if thr is not None and thr > 1:
@@ -1002,15 +1116,37 @@ def try_combine(shares, passphrase, threshold=None):
         for subset in combinations(shares, size):
             calls += 1
             if calls > MAX_SCAN_CALLS:
-                return None
+                return None, threshold
             try:
-                return combine_mnemonics(list(subset), passphrase=passphrase)
+                return combine_mnemonics(
+                    list(subset), passphrase=passphrase), threshold
             except Exception as e:
-                if not _is_cheap_failure(e):
+                if _is_expensive_failure(e):
                     size_budget -= 1
                     if size_budget <= 0:
                         break  # next candidate size, fresh budget
-    return None
+    return None, threshold
+
+
+def try_combine(shares, passphrase, threshold=None):
+    """Recover the secret from shares, tolerating extras. bytes|None."""
+    result, _ = _combine_best_effort(shares, passphrase, threshold)
+    return result
+
+
+def _learn_threshold_from_count(subset):
+    """Learn the member threshold from one combine attempt (test aid).
+
+    A successful combine means len(subset) == T exactly; a count
+    error ("Expected T mnemonics ... but N provided") names T.
+    Returns the threshold or None. NOTE: on success this runs the
+    KDF — intended for the self-test's own disposable secret only.
+    """
+    try:
+        combine_mnemonics(list(subset), passphrase=b"")
+        return len(subset)
+    except Exception as e:
+        return _threshold_from_error(e)
 
 
 # ============================================================
@@ -1253,9 +1389,8 @@ def split_existing_mnemonic():
     print("  " + t("split_intro2"))
     print()
 
+    # Both entries are normalized inside get_hidden_confirmed.
     mnemonic = get_hidden_confirmed("  " + t("seed_prompt"))
-    # Repair copy/paste artifacts (case, double spaces, line breaks).
-    mnemonic = normalize_phrase(mnemonic)
 
     print()
     print("  " + t("checking"))
@@ -1345,26 +1480,27 @@ def recover_seed():
 
     shares = []
     seen_texts = set()   # exact-text dedup (always active)
-    slots = set()        # (identifier, group, member) dedup (if known)
-    identifier = None
-    threshold = None     # learned from the shares themselves
+    identifier = None    # backup identifier of the entered shares
+    threshold = None     # learned from the library's count errors
     result = None
 
     def attempt():
         """Try to recover with everything collected so far."""
+        nonlocal threshold
         if not shares:
             return None
-        return try_combine(shares, passphrase, threshold)
+        result, learned = _combine_best_effort(shares, passphrase, threshold)
+        if learned is not None:
+            threshold = learned
+        return result
 
     def cleanup_state():
         """Drop all recovery state (used on abort and on success)."""
-        nonlocal shares, passphrase, pp, seen_texts, slots
-        nonlocal identifier, threshold
+        nonlocal shares, passphrase, pp, seen_texts, identifier, threshold
         shares = None
         passphrase = None
         pp = None
         seen_texts = None
-        slots = None
         identifier = None
         threshold = None
         purge_memory()
@@ -1376,9 +1512,7 @@ def recover_seed():
             break
 
         # Enough distinct shares but decryption fails: almost
-        # certainly a wrong passphrase. (With mixed shares from
-        # several backups this heuristic can fire early — the
-        # message deliberately says "almost always".)
+        # certainly a wrong passphrase.
         if threshold is not None and len(shares) >= threshold:
             print()
             print("  " + t("rec_pp_suspect_title"))
@@ -1433,8 +1567,7 @@ def recover_seed():
             continue
 
         # Immediate structural validation of the entered share.
-        (ok, thr, group_index, member_index, share_id,
-         err_code, err_detail) = probe_share(share)
+        ok, header, err_code, err_detail = probe_share(share)
 
         if not ok:
             if err_code == "length":
@@ -1446,24 +1579,12 @@ def recover_seed():
             print()
             continue
 
-        if thr is not None:
-            if threshold is None:
-                threshold = thr
-            elif thr != threshold:
-                print("  ⚠  " + t("rec_mixed"))
-                print()
-        if share_id is not None:
+        if header is not None:
+            share_id = header["identifier"]
             if identifier is not None and share_id != identifier:
                 print("  ⚠  " + t("rec_foreign"))
                 print()
             identifier = share_id
-        if group_index is not None and member_index is not None:
-            slot = (share_id, group_index, member_index)
-            if slot in slots:
-                print("  " + t("rec_dup_slot", member=member_index + 1))
-                print()
-                continue
-            slots.add(slot)
 
         seen_texts.add(share)
         shares.append(share)
@@ -1545,14 +1666,23 @@ def test_recovery():
     threshold, total = _choose_scheme()
 
     results = []
+    skipped = 0
 
     def check(name, fn):
+        """Run one check. fn() returning None means 'skipped'."""
+        nonlocal skipped
         try:
             ok = fn()
-            print(f"  {'✓' if ok else '✗'} {name}")
         except Exception as e:
             print(f"  ✗ {name} — {t('test_exc', err=e)}")
-            ok = False
+            results.append(False)
+            return
+        if ok is None:
+            skipped += 1
+            print(f"  – {name} — {t('test_skip',
+                                  reason=t('test_skip_no_wordlist'))}")
+            return
+        print(f"  {'✓' if ok else '✗'} {name}")
         results.append(ok)
 
     print("  " + t("test_generating"))
@@ -1601,7 +1731,8 @@ def test_recovery():
             return True
     check(t("test_5", count=threshold - 1), test_insufficient)
 
-    # Test 6: a wrong passphrase must not yield the original secret
+    # Test 6: a wrong passphrase must not yield the original secret.
+    # A complete group + wrong passphrase stops the search at once.
     def test_wrong_passphrase():
         result = try_combine(shares[:threshold], b"wrong-passphrase-test",
                              threshold=threshold)
@@ -1626,13 +1757,13 @@ def test_recovery():
         check(t("test_9"),
               lambda: try_combine(extra, b"") == bytes(entropy))
 
-    # Test 10: a foreign share (from an unrelated backup) mixed into
-    # the set must not prevent recovery of the original secret.
+    # Test 10: a foreign share (from an unrelated, passphrase-
+    # protected backup) mixed into the set must not prevent recovery
+    # of the original secret.
     def test_foreign_share():
-        junk_mnemonic = generate_seed()
-        junk_shares = split_entropy(
-            mnemonic_to_entropy(junk_mnemonic), 2, 3, b"")
-        mixed = shares[:threshold] + [junk_shares[0]]
+        junk = split_entropy(os.urandom(32), 2, 3,
+                             b"unrelated-backup-passphrase")
+        mixed = shares[:threshold] + [junk[0]]
         return try_combine(mixed, b"") == bytes(entropy)
     check(t("test_10"), test_foreign_share)
 
@@ -1643,10 +1774,54 @@ def test_recovery():
         return normalize_phrase(scrambled) == shares[0]
     check(t("test_11"), test_normalization)
 
+    # Test 12: cross-check everything the recovery logic relies on:
+    #   (a) all shares of one backup share the same identifier;
+    #   (b) distinct members have distinct 4-word headers (the
+    #       member index lives somewhere in words 1-4 — the exact
+    #       bit position is deliberately not assumed);
+    #   (c) threshold discovery agrees with the library for several
+    #       subset sizes (T-1, T, T+1).
+    def test_parser():
+        if _SLIP39_WORDS is None:
+            return None
+        ids = set()
+        prefixes = set()
+        for s in shares:
+            h = _parse_share_header(s)
+            if h is None:
+                return False
+            ids.add(h["identifier"])
+            prefixes.add(tuple(s.split()[:4]))
+        if len(ids) != 1:
+            return False
+        if len(prefixes) != len(shares):
+            return False
+        for cnt in sorted({threshold - 1, threshold,
+                           min(threshold + 1, len(shares))}):
+            if cnt < 1:
+                continue
+            if _learn_threshold_from_count(shares[:cnt]) != threshold:
+                return False
+        return True
+    check(t("test_12"), test_parser)
+
+    # Test 13: ALL shares of the backup plus several shares of an
+    # UNRELATED, passphrase-protected backup entered together — the
+    # identifier grouping must recover the original secret with a
+    # single combination attempt (regression test: v3.5 recovered
+    # the junk backup's secret via the fallback scan instead).
+    def test_two_backups_mixed():
+        junk = split_entropy(os.urandom(32), 2, 3,
+                             b"unrelated-backup-passphrase")
+        return try_combine(shares + junk, b"") == bytes(entropy)
+    check(t("test_13"), test_two_backups_mixed)
+
     print()
     print("  " + "═" * 50)
     passed = sum(1 for ok in results if ok)
     print("  " + t("test_result", passed=passed, total=len(results)))
+    if skipped:
+        print(f"  ({skipped} skipped)")
     if passed == len(results):
         print("  " + t("test_all_ok") + " ✓")
     else:
